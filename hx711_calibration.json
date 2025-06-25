@@ -1,0 +1,16 @@
+{
+    "coefficient": 0.0025461186966588127,
+    "offset": 183562.4,
+    "gain": 128,
+    "sck_pin": 11,
+    "dt_pin": 13,
+    "timestamp": "2025-06-07 16:48:00",
+    "is_calibrated": true,
+    "calibration_notes": "使用独立校准程序完成校准",
+    "standard_weight": 200.0,
+    "weight_tolerance": 10.0,
+    "check_timeout": 10.0,
+    "enable_music": true,
+    "buzzer_pin": 18,
+    "gpio_notes": "HX711使用BOARD模式，蜂鸣器自动适配GPIO模式"
+}
