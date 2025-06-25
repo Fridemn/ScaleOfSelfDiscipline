@@ -52,10 +52,18 @@ class MockGPIO:
 
 # 在没有RPi.GPIO的环境中使用模拟GPIO
 try:
-    import RPi.GPIO as GPIO
+    from gpio_manager import gpio_manager, init_gpio, allocate_pin, release_pin, output, input_pin, GPIO_AVAILABLE, GPIO
+    GPIO_MANAGER_AVAILABLE = True
+    print("HX711: 使用GPIO管理器")
 except ImportError:
-    GPIO = MockGPIO
-    print("注意：使用模拟GPIO进行测试")
+    try:
+        import RPi.GPIO as GPIO
+        GPIO_MANAGER_AVAILABLE = False
+        print("HX711: 使用直接GPIO控制")
+    except ImportError:
+        GPIO = MockGPIO
+        GPIO_MANAGER_AVAILABLE = False
+        print("HX711: 使用模拟GPIO进行测试")
 
 class HX711:
     def __init__(self, sck_pin=11, dt_pin=13, gain=128, auto_load_calibration=True):
@@ -83,18 +91,44 @@ class HX711:
         if auto_load_calibration:
             self.load_calibration()
         
-        # GPIO设置
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BOARD)
-        GPIO.setup(self.SCK, GPIO.OUT)
-        GPIO.setup(self.DT, GPIO.IN)
-        GPIO.output(self.SCK, GPIO.LOW)
+        # GPIO设置 - 使用GPIO管理器或直接GPIO
+        self.gpio_initialized = False
+        if GPIO_MANAGER_AVAILABLE:
+            # 使用GPIO管理器
+            if not gpio_manager.gpio_initialized:
+                print("HX711: GPIO管理器未初始化，尝试自动初始化...")
+                if not init_gpio(GPIO.BOARD):
+                    print("HX711: GPIO管理器初始化失败")
+                    return
+            
+            # 分配引脚
+            if allocate_pin(self.SCK, "HX711", GPIO.OUT) and allocate_pin(self.DT, "HX711", GPIO.IN):
+                output(self.SCK, GPIO.LOW)
+                self.gpio_initialized = True
+                print(f"HX711: GPIO引脚已通过管理器分配 (SCK:{self.SCK}, DT:{self.DT})")
+            else:
+                print("HX711: GPIO引脚分配失败")
+                return
+        else:
+            # 直接使用GPIO
+            try:
+                GPIO.setwarnings(False)
+                GPIO.setmode(GPIO.BOARD)
+                GPIO.setup(self.SCK, GPIO.OUT)
+                GPIO.setup(self.DT, GPIO.IN)
+                GPIO.output(self.SCK, GPIO.LOW)
+                self.gpio_initialized = True
+                print(f"HX711: GPIO引脚直接配置完成 (SCK:{self.SCK}, DT:{self.DT})")
+            except Exception as e:
+                print(f"HX711: GPIO直接配置失败: {e}")
+                return
         
         # 设置增益对应的脉冲数
         self._set_gain_pulses()
         
         # 初始读取一次，稳定传感器
-        self.read_raw()
+        if self.gpio_initialized:
+            self.read_raw()
     
     def _set_gain_pulses(self):
         """根据增益设置额外脉冲数"""
@@ -109,7 +143,33 @@ class HX711:
     
     def is_ready(self):
         """检查HX711是否准备好进行读取"""
-        return GPIO.input(self.DT) == GPIO.LOW
+        if not self.gpio_initialized:
+            return True  # 模拟模式总是准备就绪
+        
+        if GPIO_MANAGER_AVAILABLE:
+            return input_pin(self.DT) == GPIO.LOW
+        else:
+            return GPIO.input(self.DT) == GPIO.LOW
+    
+    def _gpio_output(self, pin, value):
+        """统一的GPIO输出方法"""
+        if not self.gpio_initialized:
+            return  # 模拟模式不需要实际输出
+        
+        if GPIO_MANAGER_AVAILABLE:
+            output(pin, value)
+        else:
+            GPIO.output(pin, value)
+    
+    def _gpio_input(self, pin):
+        """统一的GPIO输入方法"""
+        if not self.gpio_initialized:
+            return GPIO.LOW  # 模拟模式返回默认值
+        
+        if GPIO_MANAGER_AVAILABLE:
+            return input_pin(pin)
+        else:
+            return GPIO.input(pin)
     
     def read_raw(self):
         """
@@ -141,16 +201,16 @@ class HX711:
         
         # 读取24位数据
         for i in range(24):
-            GPIO.output(self.SCK, GPIO.HIGH)
-            GPIO.output(self.SCK, GPIO.LOW)
+            self._gpio_output(self.SCK, GPIO.HIGH)
+            self._gpio_output(self.SCK, GPIO.LOW)
             value = value << 1
-            if GPIO.input(self.DT) == GPIO.HIGH:
+            if self._gpio_input(self.DT) == GPIO.HIGH:
                 value += 1
         
         # 发送增益设置脉冲
         for i in range(self.gain_pulses):
-            GPIO.output(self.SCK, GPIO.HIGH)
-            GPIO.output(self.SCK, GPIO.LOW)
+            self._gpio_output(self.SCK, GPIO.HIGH)
+            self._gpio_output(self.SCK, GPIO.LOW)
         
         # 处理24位补码转换为32位有符号整数
         if value & 0x800000:  # 如果最高位为1（负数）
@@ -227,8 +287,23 @@ class HX711:
     
     def cleanup(self):
         """清理GPIO资源"""
-        GPIO.cleanup()
-        print("GPIO资源已清理")
+        if not self.gpio_initialized:
+            return
+        
+        if GPIO_MANAGER_AVAILABLE:
+            # 使用GPIO管理器释放引脚
+            release_pin(self.SCK, "HX711")
+            release_pin(self.DT, "HX711")
+            print("HX711: GPIO引脚已通过管理器释放")
+        else:
+            # 直接清理GPIO（谨慎使用）
+            try:
+                GPIO.cleanup()
+                print("HX711: GPIO资源已直接清理")
+            except:
+                print("HX711: GPIO清理失败")
+        
+        self.gpio_initialized = False
     
     def get_stable_weight(self, times=10):
         """

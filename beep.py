@@ -12,7 +12,20 @@
 
 """
 
-import RPi.GPIO as GPIO
+# 尝试使用GPIO管理器
+try:
+    from gpio_manager import gpio_manager, init_gpio, allocate_pin, release_pin, output, input_pin, GPIO_AVAILABLE, GPIO
+    GPIO_MANAGER_AVAILABLE = True
+    print("蜂鸣器: 使用GPIO管理器")
+except ImportError:
+    try:
+        import RPi.GPIO as GPIO
+        GPIO_MANAGER_AVAILABLE = False
+        print("蜂鸣器: 使用直接GPIO控制")
+    except ImportError:
+        GPIO_MANAGER_AVAILABLE = False
+        print("蜂鸣器: GPIO不可用")
+
 import time
 import signal
 import sys
@@ -135,46 +148,61 @@ class BadAppleBuzzer:
         signal.signal(signal.SIGINT, self.cleanup_and_exit)
         
     def setup_gpio(self):
-        """初始化GPIO设置"""
+        """设置GPIO - 使用GPIO管理器或直接控制"""
         try:
-            # 检查GPIO模式是否已设置
-            try:
-                # 尝试获取当前模式
-                current_mode = GPIO.getmode()
-                if current_mode is None:
-                    # 如果没有设置模式，使用BOARD模式
-                    GPIO.setmode(GPIO.BOARD)
-                elif current_mode != GPIO.BOARD:
-                    print(f"警告: GPIO已设置为模式 {current_mode}，将使用现有模式")
-                    # 如果是BCM模式，使用BCM引脚号
-                    if current_mode == GPIO.BCM:
-                        self.beep_pin = self.beep_pin_bcm
-            except:
-                # 如果获取模式失败，尝试设置BOARD模式
-                GPIO.setmode(GPIO.BOARD)
-            
-            # 设置引脚
-            GPIO.setup(self.beep_pin, GPIO.OUT)
-            GPIO.output(self.beep_pin, GPIO.LOW)
-            self.gpio_initialized = True
-            print(f"GPIO初始化完成，蜂鸣器引脚: {self.beep_pin} (BCM: {self.beep_pin_bcm})")
-            
-        except Exception as e:
-            print(f"GPIO初始化失败: {e}")
-            # 尝试清理并重新初始化
-            try:
-                GPIO.cleanup()
-                time.sleep(0.1)
-                GPIO.setmode(GPIO.BOARD)
+            if GPIO_MANAGER_AVAILABLE:
+                # 使用GPIO管理器
+                if not gpio_manager.gpio_initialized:
+                    print("蜂鸣器: GPIO管理器未初始化，尝试自动初始化...")
+                    if not init_gpio(GPIO.BOARD):
+                        print("蜂鸣器: GPIO管理器初始化失败")
+                        return
+                
+                # 分配引脚
+                if allocate_pin(self.beep_pin, "BadAppleBuzzer", GPIO.OUT):
+                    output(self.beep_pin, GPIO.LOW)
+                    self.gpio_initialized = True
+                    print(f"蜂鸣器: GPIO引脚已通过管理器分配 (BOARD:{self.beep_pin}, BCM:{self.beep_pin_bcm})")
+                else:
+                    print("蜂鸣器: GPIO引脚分配失败")
+                    return
+            else:
+                # 直接使用GPIO
+                if not hasattr(self, '_gpio_mode_set'):
+                    # 检查GPIO模式是否已设置
+                    try:
+                        current_mode = GPIO.getmode()
+                        if current_mode is None:
+                            GPIO.setmode(GPIO.BOARD)
+                        elif current_mode != GPIO.BOARD:
+                            print(f"警告: GPIO已设置为模式 {current_mode}，将使用现有模式")
+                            if current_mode == GPIO.BCM:
+                                self.beep_pin = self.beep_pin_bcm
+                    except:
+                        GPIO.setmode(GPIO.BOARD)
+                    
+                    self._gpio_mode_set = True
+                
+                # 设置引脚
                 GPIO.setup(self.beep_pin, GPIO.OUT)
                 GPIO.output(self.beep_pin, GPIO.LOW)
                 self.gpio_initialized = True
-                print("GPIO重新初始化成功")
-            except Exception as e2:
-                print(f"GPIO重新初始化也失败: {e2}")
-                self.gpio_initialized = False
-                raise
+                print(f"蜂鸣器: GPIO引脚直接配置完成 (BOARD:{self.beep_pin}, BCM:{self.beep_pin_bcm})")
+            
+        except Exception as e:
+            print(f"蜂鸣器GPIO初始化失败: {e}")
+            self.gpio_initialized = False
+    
+    def _gpio_output(self, pin, value):
+        """统一的GPIO输出方法"""
+        if not self.gpio_initialized:
+            return
         
+        if GPIO_MANAGER_AVAILABLE:
+            output(pin, value)
+        else:
+            GPIO.output(pin, value)
+    
     def tone(self, frequency, duration):
         """
         产生指定频率和时长的音调
@@ -200,9 +228,9 @@ class BadAppleBuzzer:
             for _ in range(cycles):
                 if self.stop_playing:
                     break
-                GPIO.output(self.beep_pin, GPIO.HIGH)
+                self._gpio_output(self.beep_pin, GPIO.HIGH)
                 time.sleep(half_period)
-                GPIO.output(self.beep_pin, GPIO.LOW)
+                self._gpio_output(self.beep_pin, GPIO.LOW)
                 time.sleep(half_period)
         except Exception as e:
             print(f"蜂鸣器输出错误: {e}")
@@ -561,11 +589,20 @@ class BadAppleBuzzer:
         self.stop_playing = True
         if self.gpio_initialized:
             try:
-                GPIO.output(self.beep_pin, GPIO.LOW)
-                # 注意：不要调用GPIO.cleanup()，因为HX711可能还在使用GPIO
-                print("蜂鸣器GPIO已清理")
-            except:
-                pass
+                # 确保蜂鸣器关闭
+                self._gpio_output(self.beep_pin, GPIO.LOW)
+                
+                if GPIO_MANAGER_AVAILABLE:
+                    # 使用GPIO管理器释放引脚
+                    release_pin(self.beep_pin, "BadAppleBuzzer")
+                    print("蜂鸣器: GPIO引脚已通过管理器释放")
+                else:
+                    # 直接模式不主动清理GPIO，避免影响其他模块
+                    print("蜂鸣器: GPIO引脚已关闭")
+                
+                self.gpio_initialized = False
+            except Exception as e:
+                print(f"蜂鸣器清理失败: {e}")
 
 def main():
     """主函数"""

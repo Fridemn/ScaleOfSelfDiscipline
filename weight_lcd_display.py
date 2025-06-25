@@ -133,7 +133,7 @@ class WeightLCDDisplay:
         self.weight_monitor = None
         if self.config.get('enable_music', False):
             try:
-                from raspberry_pi_badapple_beep import BadAppleBuzzer
+                from beep import BadAppleBuzzer
                 self.buzzer_class = BadAppleBuzzer
             except ImportError:
                 print("警告: 无法导入蜂鸣器模块")

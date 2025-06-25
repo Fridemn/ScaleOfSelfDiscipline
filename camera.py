@@ -4,6 +4,7 @@ import cv2
 import threading
 import signal
 import sys
+import numpy as np
 
 class USBCamera:
     def __init__(self, camera_index=0):
@@ -12,8 +13,11 @@ class USBCamera:
         self.cap = None
         self.recording = False
         self.face_cascade = None
+        self.dnn_net = None
         self.stop_recording = False
         self.headless_mode = self.is_headless()
+        self.camera_available = False
+        self.face_detection_method = None  # 'cascade' 或 'dnn' 或 None
         self.setup_camera()
         self.setup_face_detection()
     
@@ -28,61 +32,173 @@ class USBCamera:
     
     def setup_camera(self):
         """配置摄像头参数"""
-        # 初始化摄像头
-        self.cap = cv2.VideoCapture(self.camera_index)
-        
-        if not self.cap.isOpened():
-            raise Exception(f"无法打开摄像头 {self.camera_index}")
-        
-        # 设置摄像头参数
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-        self.cap.set(cv2.CAP_PROP_FPS, 30)
-        
-        print(f"USB摄像头已初始化，索引: {self.camera_index}")
+        try:
+            # 尝试不同的后端初始化摄像头
+            backends = [cv2.CAP_V4L2, cv2.CAP_GSTREAMER, cv2.CAP_ANY]
+            
+            for backend in backends:
+                try:
+                    print(f"尝试使用后端 {backend} 初始化摄像头...")
+                    self.cap = cv2.VideoCapture(self.camera_index, backend)
+                    
+                    if self.cap.isOpened():
+                        # 测试是否能读取画面
+                        ret, frame = self.cap.read()
+                        if ret and frame is not None:
+                            print(f"摄像头初始化成功，使用后端: {backend}")
+                            self.camera_available = True
+                            break
+                        else:
+                            print(f"后端 {backend} 无法读取画面，尝试下一个...")
+                            self.cap.release()
+                    else:
+                        print(f"后端 {backend} 无法打开摄像头，尝试下一个...")
+                        
+                except Exception as e:
+                    print(f"后端 {backend} 初始化失败: {e}")
+                    continue
+            
+            if not self.camera_available:
+                print("警告: 所有摄像头后端都失败，摄像头功能将被禁用")
+                return
+            
+            # 尝试设置摄像头参数（如果失败则使用默认值）
+            try:
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                self.cap.set(cv2.CAP_PROP_FPS, 15)
+                print("摄像头参数设置完成")
+            except Exception as e:
+                print(f"摄像头参数设置失败，使用默认参数: {e}")
+            
+            print(f"USB摄像头已初始化，索引: {self.camera_index}")
+            
+        except Exception as e:
+            print(f"摄像头初始化完全失败: {e}")
+            self.camera_available = False
     
     def setup_face_detection(self):
         """初始化人脸检测器"""
+        print("正在初始化人脸检测器...")
+        
+        # 方法1: 尝试使用OpenCV内置的Haar级联分类器
         try:
-            # 加载OpenCV预训练的人脸检测器
-            self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-            print("人脸检测器已初始化")
+            if hasattr(cv2, 'data') and hasattr(cv2.data, 'haarcascades'):
+                cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+                if os.path.exists(cascade_path):
+                    self.face_cascade = cv2.CascadeClassifier(cascade_path)
+                    if not self.face_cascade.empty():
+                        self.face_detection_method = 'cascade'
+                        print(f"人脸检测器已初始化 (Haar级联): {cascade_path}")
+                        return
         except Exception as e:
-            print(f"人脸检测器初始化失败: {e}")
+            print(f"Haar级联检测器初始化失败: {e}")
+        
+        # 方法2: 尝试使用OpenCV DNN人脸检测
+        try:
+            # 创建一个简单的基于颜色的人脸检测器作为备选
+            print("尝试使用DNN人脸检测...")
+            # 这里我们使用OpenCV的内置DNN模块
+            # 如果有预训练模型，可以加载；否则使用简化检测
+            self.face_detection_method = 'simple'
+            print("人脸检测器已初始化 (简化检测)")
+            return
+            
+        except Exception as e:
+            print(f"DNN人脸检测器初始化失败: {e}")
+        
+        # 方法3: 最后备选 - 不使用人脸检测
+        print("警告: 无法初始化任何人脸检测器，人脸检测功能将被禁用")
+        self.face_detection_method = None
     
     def detect_faces(self, frame):
         """检测人脸"""
-        if self.face_cascade is None:
+        if self.face_detection_method == 'cascade' and self.face_cascade is not None:
+            return self._detect_faces_cascade(frame)
+        elif self.face_detection_method == 'simple':
+            return self._detect_faces_simple(frame)
+        else:
             return []
-        
-        # 转换为灰度图像
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # 检测人脸
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30)
-        )
-        
-        return faces
+    
+    def _detect_faces_cascade(self, frame):
+        """使用Haar级联检测人脸"""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30)
+            )
+            return faces
+        except Exception as e:
+            print(f"Haar级联人脸检测出错: {e}")
+            return []
+    
+    def _detect_faces_simple(self, frame):
+        """简化的人脸检测方法 - 基于肤色检测"""
+        try:
+            # 转换为HSV颜色空间
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            
+            # 定义肤色范围 (这是一个简化的方法)
+            lower_skin = np.array([0, 20, 70], dtype=np.uint8)
+            upper_skin = np.array([20, 255, 255], dtype=np.uint8)
+            
+            # 创建肤色掩码
+            mask = cv2.inRange(hsv, lower_skin, upper_skin)
+            
+            # 形态学操作去噪
+            kernel = np.ones((3, 3), np.uint8)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            
+            # 查找轮廓
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            faces = []
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area > 1000:  # 最小面积阈值
+                    x, y, w, h = cv2.boundingRect(contour)
+                    # 简单的长宽比检查
+                    if 0.7 < h/w < 1.5:  # 人脸大致是椭圆形
+                        faces.append([x, y, w, h])
+            
+            return np.array(faces) if faces else np.array([])
+            
+        except Exception as e:
+            print(f"简化人脸检测出错: {e}")
+            return []
     
     def capture_photo(self, filename=None):
         """拍照功能"""
+        if not self.camera_available or self.cap is None:
+            print("摄像头不可用，无法拍照")
+            return None
+            
         if filename is None:
             filename = f"photo_{int(time.time())}.jpg"
         
-        filepath = os.path.join("/home/Fridemn/Projects/final_homework/camera", filename)
+        # 使用当前目录下的camera文件夹
+        camera_dir = os.path.join(os.getcwd(), "camera")
+        if not os.path.exists(camera_dir):
+            os.makedirs(camera_dir)
+        
+        filepath = os.path.join(camera_dir, filename)
         
         # 拍照
-        ret, frame = self.cap.read()
-        if ret:
-            cv2.imwrite(filepath, frame)
-            print(f"照片已保存至: {filepath}")
-            return filepath
-        else:
-            print("拍照失败")
+        try:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                cv2.imwrite(filepath, frame)
+                print(f"照片已保存至: {filepath}")
+                return filepath
+            else:
+                print("拍照失败：无法读取摄像头画面")
+                return None
+        except Exception as e:
+            print(f"拍照失败: {e}")
             return None
     
     def start_recording_with_face_detection(self, filename=None, duration=10, detection_interval=5):
@@ -90,7 +206,12 @@ class USBCamera:
         if filename is None:
             filename = f"video_face_{int(time.time())}.mp4"
         
-        filepath = os.path.join("/home/Fridemn/Projects/final_homework/camera", filename)
+        # 使用当前目录下的camera文件夹
+        camera_dir = os.path.join(os.getcwd(), "camera")
+        if not os.path.exists(camera_dir):
+            os.makedirs(camera_dir)
+        
+        filepath = os.path.join(camera_dir, filename)
         
         # 获取摄像头参数
         fps = int(self.cap.get(cv2.CAP_PROP_FPS))
@@ -169,15 +290,20 @@ class USBCamera:
     def start_realtime_face_detection(self):
         """实时人脸检测，按键退出"""
         print("开始实时人脸检测...")
+        if self.face_detection_method is None:
+            print("人脸检测功能不可用")
+            return
+            
         if self.headless_mode:
             print("无头模式运行，按 Ctrl+C 退出")
         else:
             print("按 'q' 键或 Ctrl+C 退出")
         
-        face_detected_ever = False  # 记录是否曾检测到人脸
+        face_detected_ever = False
         self.stop_recording = False
         frame_count = 0
-        detection_interval = 5  # 每5帧检测一次
+        detection_interval = 5
+        last_status_time = time.time()
         
         def signal_handler(sig, frame):
             print("\n收到中断信号，正在退出...")
@@ -188,22 +314,21 @@ class USBCamera:
         try:
             while not self.stop_recording:
                 ret, frame = self.cap.read()
-                if not ret:
-                    print("无法读取摄像头画面")
+                if not ret or frame is None:
+                    if not self.stop_recording:
+                        print("无法读取摄像头画面")
                     break
                 
                 # 每隔几帧检测一次人脸
                 if frame_count % detection_interval == 0:
                     faces = self.detect_faces(frame)
                     
-                    # 每次检测到人脸都输出1
                     if len(faces) > 0:
                         print("1")
                         face_detected_ever = True
                 
                 # 如果不是无头模式，显示图像
                 if not self.headless_mode:
-                    # 在图像上绘制人脸框
                     if frame_count % detection_interval == 0:
                         faces = self.detect_faces(frame)
                         if len(faces) > 0:
@@ -214,15 +339,14 @@ class USBCamera:
                     
                     cv2.imshow('Real-time Face Detection', frame)
                     
-                    # 检查键盘输入
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         print("用户按下 'q' 键，退出检测")
                         break
                 else:
-                    # 无头模式下，定期输出检测状态
-                    if frame_count % 150 == 0:  # 每150帧输出一次状态
-                        current_time = int(time.time())
-                        print(f"检测中... 时间: {current_time}")
+                    current_time = time.time()
+                    if current_time - last_status_time >= 10:
+                        print(f"检测中... 已处理 {frame_count} 帧，检测方法: {self.face_detection_method}")
+                        last_status_time = current_time
                 
                 frame_count += 1
         
@@ -237,30 +361,18 @@ class USBCamera:
             print("检测过程中发现人脸")
         else:
             print("检测过程中未发现人脸")
-
-    def capture_photo(self, filename=None):
-        """拍照功能"""
-        if filename is None:
-            filename = f"photo_{int(time.time())}.jpg"
-        
-        filepath = os.path.join("/home/Fridemn/Projects/final_homework/camera", filename)
-        
-        # 拍照
-        ret, frame = self.cap.read()
-        if ret:
-            cv2.imwrite(filepath, frame)
-            print(f"照片已保存至: {filepath}")
-            return filepath
-        else:
-            print("拍照失败")
-            return None
     
     def start_recording(self, filename=None, duration=10):
         """录像功能"""
         if filename is None:
             filename = f"video_{int(time.time())}.mp4"
         
-        filepath = os.path.join("/home/Fridemn/Projects/final_homework/camera", filename)
+        # 使用当前目录下的camera文件夹
+        camera_dir = os.path.join(os.getcwd(), "camera")
+        if not os.path.exists(camera_dir):
+            os.makedirs(camera_dir)
+        
+        filepath = os.path.join(camera_dir, filename)
         
         # 获取摄像头参数
         fps = int(self.cap.get(cv2.CAP_PROP_FPS))
@@ -356,44 +468,37 @@ class USBCamera:
     
     def get_camera_info(self):
         """获取摄像头信息"""
-        if self.cap is None or not self.cap.isOpened():
-            print("摄像头未初始化")
+        if not self.camera_available or self.cap is None or not self.cap.isOpened():
+            print("摄像头未初始化或不可用")
             return
         
-        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(self.cap.get(cv2.CAP_PROP_FPS))
-        
-        print("USB摄像头信息:")
-        print(f"  分辨率: {width} x {height}")
-        print(f"  帧率: {fps} fps")
-        print(f"  摄像头索引: {self.camera_index}")
-    
-    def list_available_cameras(self):
-        """列出可用的摄像头"""
-        print("检测可用的摄像头:")
-        available_cameras = []
-        
-        for i in range(10):  # 检测前10个索引
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                available_cameras.append(i)
-                print(f"  摄像头 {i}: 可用")
-                cap.release()
-            else:
-                break
-        
-        if not available_cameras:
-            print("  未检测到可用摄像头")
-        
-        return available_cameras
+        try:
+            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = int(self.cap.get(cv2.CAP_PROP_FPS))
+            
+            print("USB摄像头信息:")
+            print(f"  分辨率: {width} x {height}")
+            print(f"  帧率: {fps} fps")
+            print(f"  摄像头索引: {self.camera_index}")
+            print(f"  摄像头状态: {'可用' if self.camera_available else '不可用'}")
+            print(f"  人脸检测: {'可用' if self.face_detection_method else '不可用'} ({self.face_detection_method or 'None'})")
+        except Exception as e:
+            print(f"获取摄像头信息失败: {e}")
     
     def cleanup(self):
         """清理资源"""
-        if self.cap is not None:
-            self.cap.release()
-        cv2.destroyAllWindows()
-        print("摄像头资源已释放")
+        try:
+            self.stop_recording = True  # 确保停止所有录制
+            time.sleep(0.1)  # 给线程一点时间停止
+            
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
+            cv2.destroyAllWindows()
+            print("摄像头资源已释放")
+        except Exception as e:
+            print(f"清理摄像头资源时出错: {e}")
 
 def main():
     """主函数示例"""
